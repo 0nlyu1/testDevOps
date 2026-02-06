@@ -1,59 +1,69 @@
-version: '3.8'
+# version: "3.9"    # <- 경고만 유발하므로 그대로 생략
 
 services:
   web:
     image: ${DOCKERHUB_USERNAME}/myflask:latest
-    build: null
-    environment:
-      - FLASK_ENV=production
+    environment: # <- 매핑 형식
+      FLASK_ENV: production
     expose:
       - "5000"
-    ports: []  # 외부 노출은 nginx가 담당
     restart: unless-stopped
 
   nginx:
+    container_name: nginx
     image: nginx:alpine
     depends_on:
       - web
     ports:
       - "80:80"
+      - "443:443"
     volumes:
-      - ./nginx:/etc/nginx/conf.d:ro
+      - ./nginx/default.conf.template:/etc/nginx/templates/default.conf.template:ro
+      - ./certbot/config:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    environment: # <- 매핑 형식
+      DOMAIN: ${DOMAIN}
+    entrypoint:
+      - sh
+      - -exc
+      - |
+        envsubst '$DOMAIN' < /etc/nginx/templates/default.conf.template \
+          > /etc/nginx/conf.d/default.conf
+        exec nginx -g 'daemon off;'
     restart: unless-stopped
 
-deploy:
-  needs: build-and-push
-  runs-on: ubuntu-latest
-  env:
-    DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
-    REMOTE_APP_DIR: ${{ secrets.REMOTE_APP_DIR }}
+  certbot:
+    image: certbot/certbot
+    command:
+      - certonly
+      - --webroot
+      - --webroot-path=/var/www/certbot
+      - --non-interactive
+      - --agree-tos
+      - --email
+      - "${LETSENCRYPT_EMAIL}"
+      - -d
+      - "${DOMAIN}"
+    volumes:
+      - ./certbot/config:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+    restart: "no"
 
-  steps:
-    - uses: actions/checkout@v3
+  certbot-renew:
+    image: certbot/certbot
+    volumes:
+      - ./certbot/config:/etc/letsencrypt
+      - ./certbot/www:/var/www/certbot
+      - /var/run/docker.sock:/var/run/docker.sock
+    entrypoint: >
+      sh -c "while true; do
+        certbot renew --quiet --deploy-hook 'docker exec nginx nginx -s reload';
+        sleep 12h;
+      done"
+    restart: unless-stopped
 
-    - name: Prepare SSH
-      run: |
-        mkdir -p ~/.ssh
-        echo "${{ secrets.GCP_SSH_KEY }}" > ~/.ssh/id_rsa
-        chmod 600 ~/.ssh/id_rsa
-        ssh-keyscan -H ${{ secrets.GCP_HOST }} >> ~/.ssh/known_hosts
-
-    - name: Ensure remote dir exists
-      run: |
-        ssh -i ~/.ssh/id_rsa ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }} "\
-          mkdir -p ${REMOTE_APP_DIR}"
-
-    - name: Copy files to VM (scp)
-      run: |
-        scp -i ~/.ssh/id_rsa -o StrictHostKeyChecking=no -r \
-          docker-compose.yml docker-compose.prod.yml nginx \
-          ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }}:${REMOTE_APP_DIR}/
-
-    - name: Pull & restart on VM
-      run: |
-        ssh -i ~/.ssh/id_rsa ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }} "\
-          set -euo pipefail; \
-          cd ${REMOTE_APP_DIR} && \
-          export DOCKERHUB_USERNAME=${DOCKERHUB_USERNAME} && \
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml pull && \
-          docker compose -f docker-compose.yml -f docker-compose.prod.yml up -d --remove-orphans"
+volumes:
+  certbot-config:
+    driver: local
+  certbot-www:
+    driver: local
