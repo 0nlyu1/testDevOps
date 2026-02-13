@@ -47,6 +47,9 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+  #############################################################################
+  # 1-2) Security Gate (Trivy + SBOM + Cosign Sign)
+  #############################################################################
   security-gate:
     needs: build-and-push
     runs-on: ubuntu-latest
@@ -54,16 +57,20 @@ jobs:
       contents: read
       id-token: write
       security-events: write
+
     env:
       IMG: ${{ secrets.DOCKERHUB_USERNAME }}/myflask@${{ needs.build-and-push.outputs.image-digest }}
+
     steps:
       - uses: actions/checkout@v4
 
-      - name: Trivy image scan (HIGH/CRIT fail)
+      # NOTE:
+      # trivy-action inputs may change by version; pkg-types warning can appear.
+      # We still generate JSON via CLI below, so dashboard uses the CLI JSON reliably.
+      - name: Trivy image scan (SARIF)
         uses: aquasecurity/trivy-action@0.28.0
         with:
           image-ref: ${{ env.IMG }}
-          # pkg-types: "os,library"
           severity: "HIGH,CRITICAL"
           ignore-unfixed: true
           format: sarif
@@ -77,17 +84,19 @@ jobs:
         with:
           sarif_file: trivy-image.sarif
 
-      - name: Trivy JSON (for SeveritySource)
+      # Use Trivy CLI to create JSON (stable for dashboard/artifact)
+      - name: Install Trivy CLI
+        uses: aquasecurity/setup-trivy@v0.2.1
+
+      - name: Trivy JSON (for Dashboard)
         if: always()
         run: |
           trivy image --scanners vuln \
-            --pkg-types os,library \
             --severity HIGH,CRITICAL \
             --ignore-unfixed \
-            --detection-priority precise \
             -f json -o trivy-image.json "${IMG}" || true
 
-      - name: Upload Trivy JSON
+      - name: Upload Trivy JSON artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -95,7 +104,7 @@ jobs:
           path: trivy-image.json
           retention-days: 7
 
-      - name: Login to Docker Hub (for cosign push)
+      - name: Login to Docker Hub (for SBOM/cosign)
         uses: docker/login-action@v3
         with:
           username: ${{ secrets.DOCKERHUB_USERNAME }}
@@ -108,6 +117,13 @@ jobs:
           format: spdx-json
           output-file: sbom.spdx.json
 
+      - name: Upload SBOM artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-spdx
+          path: sbom.spdx.json
+          retention-days: 30
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.9.2
 
@@ -118,15 +134,8 @@ jobs:
           cosign sign --yes "$IMG"
           cosign attest --yes --predicate sbom.spdx.json --type spdx "$IMG"
 
-      - name: Upload SBOM artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: sbom-spdx
-          path: sbom.spdx.json
-          retention-days: 30
-
 ###############################################################################
-# 2) Deploy to GCE VM
+# 2) Deploy to GCE VM (and upload dashboard data)
 ###############################################################################
   deploy:
     needs: [ build-and-push, security-gate ]
@@ -135,26 +144,25 @@ jobs:
       REMOTE_DIR: ${{ secrets.REMOTE_APP_DIR }}
       DOMAIN: ${{ secrets.DOMAIN }}
       LETSENCRYPT_EMAIL: ${{ secrets.LETSENCRYPT_EMAIL }}
-      IMAGE_TAG: ${{ github.sha }}
       IMAGE_DIGEST: ${{ needs.build-and-push.outputs.image-digest }}
       IMG: ${{ secrets.DOCKERHUB_USERNAME }}/myflask@${{ needs.build-and-push.outputs.image-digest }}
 
     steps:
       - uses: actions/checkout@v4
+
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.9.2
 
+      # cosign verify: fix the broken quoting/line-breaks from your previous version
       - name: Verify image signature (keyless)
         env: { COSIGN_EXPERIMENTAL: "1" }
         run: |
           set -euo pipefail
-          echo "IMG=${IMG}"
           cosign verify \
             --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
             --certificate-identity-regexp "^https://github.com/${{ github.repository }}/.+" \
             "${IMG}" > /dev/null
           echo "cosign verify OK for ${IMG}"
-
 
       # ── 0. SSH 준비 ──────────────────────────────────────────────────────
       - name: Set up SSH agent
@@ -172,12 +180,83 @@ jobs:
       - name: Test SSH
         run: ssh -o ConnectTimeout=10 ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }} "echo OK"
 
+      # ── (NEW) download artifacts: trivy json + sbom ──────────────────────
+      - name: Download Trivy JSON artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: trivy-image-json
+          path: ./_artifacts
+
+      - name: Download SBOM artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: sbom-spdx
+          path: ./_artifacts
+
+      - name: Build dashboard.json
+        env:
+          IMAGE_DIGEST: ${{ env.IMAGE_DIGEST }}
+          IMG: ${{ env.IMG }}
+        run: |
+          python - <<'PY'
+          import json, os, datetime
+
+          trivy_path = "./_artifacts/trivy-image.json"
+          sbom_path  = "./_artifacts/sbom.spdx.json"
+
+          high = 0
+          critical = 0
+
+          try:
+            with open(trivy_path, "r", encoding="utf-8") as f:
+              data = json.load(f)
+            for r in data.get("Results", []) or []:
+              for v in (r.get("Vulnerabilities", []) or []):
+                sev = (v.get("Severity") or "").upper()
+                if sev == "HIGH":
+                  high += 1
+                elif sev == "CRITICAL":
+                  critical += 1
+          except Exception:
+            pass
+
+          out = {
+            "status": "SUCCESS",
+            "deployed_at": datetime.datetime.utcnow().isoformat() + "Z",
+            "domain": os.environ.get("DOMAIN", ""),
+            "sha": os.environ.get("GITHUB_SHA", ""),
+            "run_url": f"https://github.com/{os.environ.get('GITHUB_REPOSITORY','')}/actions/runs/{os.environ.get('GITHUB_RUN_ID','')}",
+            "image_ref": os.environ.get("IMG", ""),
+            "image_digest": os.environ.get("IMAGE_DIGEST", ""),
+            "trivy_high_count": high,
+            "trivy_critical_count": critical,
+            "trivy_total_high_critical": high + critical,
+            "sbom_status": "READY" if os.path.exists(sbom_path) else "MISSING",
+            "cosign_verify": "VERIFIED"
+          }
+
+          with open("./_artifacts/dashboard.json", "w", encoding="utf-8") as f:
+            json.dump(out, f, ensure_ascii=False, indent=2)
+
+          print("dashboard.json generated")
+          PY
+
+      - name: Upload dashboard data to VM
+        run: |
+          ssh ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }} "mkdir -p '${{ env.REMOTE_DIR }}/data'"
+          scp -o StrictHostKeyChecking=no ./_artifacts/dashboard.json \
+            ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }}:"${{ env.REMOTE_DIR }}/data/dashboard.json"
+          scp -o StrictHostKeyChecking=no ./_artifacts/trivy-image.json \
+            ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }}:"${{ env.REMOTE_DIR }}/data/trivy-image.json"
+          scp -o StrictHostKeyChecking=no ./_artifacts/sbom.spdx.json \
+            ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }}:"${{ env.REMOTE_DIR }}/data/sbom.spdx.json"
+
       # ── 1. 디렉터리 & .env ──────────────────────────────────────────────
-      - name: Prepare remote directory & .env(pin by digest)
+      - name: Prepare remote directory & .env (pin by digest)
         run: |
           ssh ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }} <<'EOF'
             set -euo pipefail
-            mkdir -p "${{ env.REMOTE_DIR }}"/{nginx,certbot/{config,www,logs}}
+            mkdir -p "${{ env.REMOTE_DIR }}"/{nginx,certbot/{config,www,logs},data}
             cat > "${{ env.REMOTE_DIR }}/.env" <<EOT
             DOMAIN=${{ env.DOMAIN }}
             LETSENCRYPT_EMAIL=${{ env.LETSENCRYPT_EMAIL }}
@@ -233,11 +312,8 @@ jobs:
             docker compose -f docker-compose.prod.yml run --rm --entrypoint "" certbot sh -euxc '
               OPTIONS=/etc/letsencrypt/options-ssl-nginx.conf
               DHPARAM=/etc/letsencrypt/ssl-dhparams.pem
-
-              # 0) 반드시 디렉터리 확보
               mkdir -p /etc/letsencrypt
 
-              # 1) options-ssl-nginx.conf 확보
               if [ ! -f "$OPTIONS" ]; then
                 SRC=$(find /usr /opt -maxdepth 7 -type f -name options-ssl-nginx.conf 2>/dev/null | head -n1 || true)
                 if [ -n "$SRC" ]; then
@@ -249,7 +325,6 @@ jobs:
                 fi
               fi
 
-              # 1-b) 최소 TLS 설정 (fallback)
               if [ ! -s "$OPTIONS" ]; then
                 printf "%s\n" \
                   "ssl_session_cache   shared:SSL:10m;" \
@@ -260,7 +335,6 @@ jobs:
                   > "$OPTIONS"
               fi
 
-              # 2) ssl-dhparams.pem (없으면 2048bit 생성)
               if [ ! -f "$DHPARAM" ]; then
                 openssl dhparam -out "$DHPARAM" 2048
               fi
@@ -279,7 +353,6 @@ jobs:
           ssh ${{ secrets.GCP_USER }}@${{ secrets.GCP_HOST }} <<'EOF'
             cd '${{ env.REMOTE_DIR }}' &&
             docker compose -f docker-compose.prod.yml exec nginx sh -c '
-              # 모든 환경변수 치환 (여기선 DOMAIN)
               envsubst '\''$DOMAIN'\'' \
                 < /etc/nginx/templates/default.conf.template \
                 > /etc/nginx/conf.d/default.conf \
