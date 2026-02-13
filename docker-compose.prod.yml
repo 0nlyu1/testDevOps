@@ -1,13 +1,14 @@
 services:
   web:
-    image: ${IMAGE_REF}   # ✅ digest pin (cd.yml에서 .env에 IMAGE_REF 넣어줌)
+    image: ${IMAGE_REF}   # digest pin (cd.yml에서 .env에 IMAGE_REF 넣어줌)
     environment:
       FLASK_ENV: production
       DASH_DATA_DIR: /app/data
     volumes:
-      - ./data:/app/data:ro   # ✅ VM의 REMOTE_DIR/data 를 컨테이너에 읽기전용 마운트
+      - ./data:/app/data:ro   # VM의 REMOTE_DIR/data -> 컨테이너 /app/data (읽기전용)
     expose:
       - "5000"
+    command: ["python", "app.py"]
     restart: unless-stopped
 
   nginx:
