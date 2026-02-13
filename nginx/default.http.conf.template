@@ -1,30 +1,15 @@
-# HTTP only - issue/renew certificates
+# HTTP only – issue/renew certificates
 server {
     listen 80;
     server_name $DOMAIN;
 
-    # Let's Encrypt web-root
+    # Let’s Encrypt web‑root
     location ^~ /.well-known/acme-challenge/ {
         root /var/www/certbot;
         allow all;
     }
 
-    # 1) HTTP -> HTTPS 리다이렉트 + ACME
-    location / {
-        return 301 https://$host$request_uri;
-    }
-}
-
-# 2) HTTPS 서비스
-server {
-    listen 443 ssl;
-    server_name $DOMAIN;
-
-    ssl_certificate     /etc/letsencrypt/live/$DOMAIN/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/$DOMAIN/privkey.pem;
-    include             /etc/letsencrypt/options-ssl-nginx.conf;
-    ssl_dhparam         /etc/letsencrypt/ssl-dhparams.pem;
-
+    # 임시로 Flask 바로 노출
     location / {
         proxy_pass http://web:5000;
         proxy_set_header Host              $host;
