@@ -169,6 +169,11 @@ jobs:
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.GCP_SSH_KEY }}
+          
+      - name: Debug SSH key loaded (safe)
+        run: |
+          echo "== ssh-add -l =="
+          ssh-add -l || true
 
       - name: Add host key
         run: |
