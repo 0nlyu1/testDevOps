@@ -172,10 +172,9 @@ jobs:
 
       - name: Debug SSH public key (safe)
         run: |
-        echo "== ssh-add -l =="
-        ssh-add -l || true
-        echo "== ssh-add -L (public key) =="
-        ssh-add -L || true
+          ssh-add -l || true
+          ssh-add -L || true
+
 
 
       - name: Add host key
