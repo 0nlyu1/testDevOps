@@ -1,6 +1,6 @@
 import os
 import json
-from flask import Flask, jsonify, render_template
+from flask import Flask, jsonify, render_template, redirect
 
 app = Flask(__name__)
 
@@ -18,13 +18,14 @@ def load_dashboard():
         }
 
 @app.get("/")
+@app.get("/")
 def home():
-    dash = load_dashboard()
-    return render_template("index.html", dash=dash)
+    return redirect("/dashboard")
 
 @app.get("/dashboard")
 def dashboard():
-    return render_template("dashboard.html")
+    dash = load_dashboard()
+    return render_template("dashboard.html", dash=dash)
 
 @app.get("/api/dashboard")
 def api_dashboard():
