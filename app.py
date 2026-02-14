@@ -22,10 +22,13 @@ def home():
     dash = load_dashboard()
     return render_template("index.html", dash=dash)
 
+@app.get("/dashboard")
+def dashboard():
+    return render_template("dashboard.html")
+
 @app.get("/api/dashboard")
 def api_dashboard():
     return jsonify(load_dashboard())
 
 if __name__ == "__main__":
-    # 컨테이너/리버스프록시 환경에서는 반드시 0.0.0.0 로 바인딩
     app.run(host="0.0.0.0", port=5000, debug=False)
