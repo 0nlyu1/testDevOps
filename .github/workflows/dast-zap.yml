@@ -1,0 +1,37 @@
+name: DAST — ZAP Baseline
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 18 * * *"   # 매일 03:00 KST
+  push:
+    branches: [ main ]
+
+jobs:
+  zap-baseline:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      security-events: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ZAP Baseline Scan
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: https://${{ secrets.DOMAIN }}
+          rules_file_name: .zap/rules.tsv
+          cmd_options: >
+            -m 5              # passive 기본
+            -a                # alpha 규칙 포함(실험)
+          allow_issue_writing: false
+          artifact_name: zap-scan     # 결과 업로드 아티팩트
+          fail_action: false          # 안정성 우선
+
+      # HTML/JSON 리포트는 액션이 기본으로 아티팩트로 생성.
+      # SARIF로 올리고 싶으면:
+      - name: Upload empty SARIF (optional placeholder)
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: .github/empty.sarif
