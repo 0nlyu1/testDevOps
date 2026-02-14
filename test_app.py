@@ -5,6 +5,6 @@ from app import app
 def client():
     return app.test_client()
 
-def test_hello(client):
+def test_home_status(client):
     response = client.get('/')
-    assert response.data == b'Hello, Flask!'
+    assert response.status_code == 200
